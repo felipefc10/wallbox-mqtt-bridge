@@ -549,6 +549,33 @@ func (w *Wallbox) EffectiveStatus() string {
 	return "Unknown"
 }
 
+// ControlPilotLetter returns the IEC 61851 control pilot state as a single letter
+// (A no car, B car connected, C charging, E/F error), the form EV chargers are
+// usually read in by energy managers such as evcc. "" while no source has a value.
+func (w *Wallbox) ControlPilotLetter() string {
+	return controlPilotLetter(w.effectiveCP())
+}
+
+// controlPilotLetter maps a CP code (0xA1, 0xB2, 0xC1, ..., 0xE, 0xF) to its letter:
+// the high nibble is the state, the low nibble only a sub-state.
+func controlPilotLetter(cp int) string {
+	switch {
+	case cp == 0xE:
+		return "E"
+	case cp == 0xF:
+		return "F"
+	case cp >= 0xA0 && cp <= 0xAF:
+		return "A"
+	case cp >= 0xB0 && cp <= 0xBF:
+		return "B"
+	case cp >= 0xC0 && cp <= 0xCF:
+		return "C"
+	case cp >= 0xD0 && cp <= 0xDF:
+		return "D"
+	}
+	return ""
+}
+
 func (w *Wallbox) ControlPilotStatus() string {
 	if cp := w.effectiveCP(); cp > 0 {
 		desc, ok := controlPilotStates[cp]
