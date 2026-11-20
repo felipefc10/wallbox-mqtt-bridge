@@ -120,13 +120,13 @@ func TestParseLease(t *testing.T) {
 
 func TestLeaseOutOfOrderDropped(t *testing.T) {
 	l, ch, _ := newTestLease(t, 6, false)
-	l.handle("16 5 7 101")
-	l.handle("28 5 7 100") // older, higher current arriving late: must not win
+	l.handle("16 5 7 1001")
+	l.handle("28 5 7 1000") // older, higher current arriving late: must not win
 	if ch.cur() != 16 {
 		t.Fatalf("an out-of-order lease set %d A", ch.cur())
 	}
-	l.handle("16 5 7 101") // a duplicate is not newer either
-	l.handle("20 5 7 102")
+	l.handle("16 5 7 1001") // a duplicate is not newer either
+	l.handle("20 5 7 1002")
 	if ch.cur() != 20 {
 		t.Fatalf("the next lease in order was not applied: %d", ch.cur())
 	}
