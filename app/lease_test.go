@@ -91,32 +91,55 @@ func markerExists(marker string) bool {
 
 func TestParseLease(t *testing.T) {
 	good := []struct {
-		in      string
-		amps    int
-		hold    time.Duration
-		fb      int
-		release bool
+		in   string
+		want leaseMsg
 	}{
-		{"28 20 7", 28, 20 * time.Second, 7, false},
-		{" 16  12.5  6 ", 16, 12500 * time.Millisecond, 6, false},
-		{"0", 0, 0, 0, true},
-		{"6 3600 6", 6, time.Hour, 6, false},
-		{"32 1 0", 32, time.Second, 0, false},
+		{"28 20 7", leaseMsg{amps: 28, hold: 20 * time.Second, fallback: 7}},
+		{" 16  12.5  6 ", leaseMsg{amps: 16, hold: 12500 * time.Millisecond, fallback: 6}},
+		{"0", leaseMsg{release: true}},
+		{"6 3600 6", leaseMsg{amps: 6, hold: time.Hour, fallback: 6}},
+		{"32 1 0", leaseMsg{amps: 32, hold: time.Second, fallback: 0}},
+		{"28 20 7 1795300000123", leaseMsg{amps: 28, hold: 20 * time.Second, fallback: 7, seq: 1795300000123}},
 	}
 	for _, g := range good {
-		a, h, fb, rel, ok := parseLease(g.in, 32)
-		if !ok || a != g.amps || h != g.hold || fb != g.fb || rel != g.release {
-			t.Errorf("parseLease(%q) = %d %v %d %v %v", g.in, a, h, fb, rel, ok)
+		m, ok := parseLease(g.in, 32)
+		if !ok || m != g.want {
+			t.Errorf("parseLease(%q) = %+v %v, want %+v", g.in, m, ok, g.want)
 		}
 	}
-	bad := []string{"", "28", "28 20", "28 20 7 1", "x 20 7", "28 x 7", "28 20 x", "-1 20 7",
+	bad := []string{"", "28", "28 20", "28 20 7 1 2", "x 20 7", "28 x 7", "28 20 x", "-1 20 7",
 		"28 0 7", "28 -5 7", "28 20 -1", "28 3601 7", "1", "28 NaN 7", "28 nan 7", "28 Inf 7",
-		"28 1e-9 7", "28 0.5 7", "33 20 7", "99 20 7", "2147483648 20 7", "28 20 33"}
+		"28 1e-9 7", "28 0.5 7", "33 20 7", "99 20 7", "2147483648 20 7", "28 20 33",
+		"28 20 7 x", "28 20 7 0", "28 20 7 -5"}
 	for _, b := range bad {
-		if _, _, _, _, ok := parseLease(b, 32); ok {
+		if _, ok := parseLease(b, 32); ok {
 			t.Errorf("parseLease(%q) accepted", b)
 		}
 	}
+}
+
+func TestLeaseOutOfOrderDropped(t *testing.T) {
+	l, ch, _ := newTestLease(t, 6, false)
+	l.handle("16 5 7 101")
+	l.handle("28 5 7 100") // older, higher current arriving late: must not win
+	if ch.cur() != 16 {
+		t.Fatalf("an out-of-order lease set %d A", ch.cur())
+	}
+	l.handle("16 5 7 101") // a duplicate is not newer either
+	l.handle("20 5 7 102")
+	if ch.cur() != 20 {
+		t.Fatalf("the next lease in order was not applied: %d", ch.cur())
+	}
+	l.handle("18 5 7 5") // far behind: the controller restarted its count, taken
+	if ch.cur() != 18 {
+		t.Fatalf("a restarted controller's lease was dropped: %d", ch.cur())
+	}
+	l.handle("19 5 7 6")
+	if ch.cur() != 19 {
+		t.Fatalf("counting on after a restart: %d", ch.cur())
+	}
+	l.handle("20 5 7") // a lease without <seq> is always taken
+	l.handle("0")
 }
 
 func TestLeaseSetsCurrentAndExpiresToFallback(t *testing.T) {

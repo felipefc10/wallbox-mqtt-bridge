@@ -14,7 +14,7 @@ import (
 // A lease lets the controller that sets the current (for example evcc's load
 // management) say how long its current may stand without hearing from it again:
 //
-//	<topic prefix>/lease/set   "<amps> <seconds> <fallback amps>"   or "0" to release
+//	<topic prefix>/lease/set   "<amps> <seconds> <fallback amps> [<seq>]"   or "0" to release
 //
 // Every lease sets the current to <amps> and restarts a countdown of <seconds>.
 // If no new lease arrives in time, the bridge lowers the current to <fallback>
@@ -39,6 +39,10 @@ import (
 // here) and should use QoS 0, so that a lease queued during its own reconnect
 // is dropped rather than delivered late. A lease delayed in flight still counts
 // from its arrival, so the worst-case hold is <seconds> plus the network delay.
+// <seq>, optional, is a counter the controller increases with every lease. A lease
+// just behind the last one seen (up to leaseSeqWindow back) arrived out of order and
+// is dropped, so an older, higher current can never overtake a newer, lower one. A
+// much lower <seq> means the controller restarted its count: it is taken.
 type lease struct {
 	getCurrent func() int // fresh read of the setting; -1 when unknown
 	setCurrent func(int)
@@ -52,12 +56,25 @@ type lease struct {
 	fallback   int  // fallback of the active lease, or of the last one after a release
 	active     bool // a lease is running
 	gen        uint64
-	badPayload int // malformed payloads seen, for a quiet log
+	lastSeq    int64 // highest <seq> seen, 0 before the first
+	badPayload int   // malformed and out-of-order payloads seen, for a quiet log
+}
+
+// leaseMsg is one parsed lease message
+type leaseMsg struct {
+	amps, fallback int
+	hold           time.Duration
+	seq            int64 // 0 when absent
+	release        bool
 }
 
 // leaseMinAmps is the lowest charging current of a charger (IEC 61851): the safe
 // target when the fallback itself is unknown.
 const leaseMinAmps = 6
+
+// leaseSeqWindow is how far behind the last <seq> a lease counts as out of order
+// rather than as a restarted controller. Reordering spans a few messages at most.
+const leaseSeqWindow = 100
 
 func newLease(get func() int, set func(int), maxAmps int, marker string) *lease {
 	return &lease{
@@ -67,28 +84,36 @@ func newLease(get func() int, set func(int), maxAmps int, marker string) *lease 
 	}
 }
 
-// parseLease reads "<amps> <seconds> <fallback>" or "0". ok is false for anything else.
-func parseLease(payload string, maxAmps int) (amps int, hold time.Duration, fallback int, release bool, ok bool) {
+// parseLease reads "<amps> <seconds> <fallback> [<seq>]" or "0". ok is false for anything else.
+func parseLease(payload string, maxAmps int) (m leaseMsg, ok bool) {
 	f := strings.Fields(payload)
 	if len(f) == 1 && f[0] == "0" {
-		return 0, 0, 0, true, true
+		return leaseMsg{release: true}, true
 	}
-	if len(f) != 3 {
-		return 0, 0, 0, false, false
+	if len(f) != 3 && len(f) != 4 {
+		return leaseMsg{}, false
 	}
 	a, err1 := strconv.Atoi(f[0])
 	s, err2 := strconv.ParseFloat(f[1], 64)
 	fb, err3 := strconv.Atoi(f[2])
 	if err1 != nil || err2 != nil || err3 != nil || math.IsNaN(s) ||
 		a < 0 || a > maxAmps || fb < 0 || fb > maxAmps || s < 1 || s > 3600 {
-		return 0, 0, 0, false, false
+		return leaseMsg{}, false
 	}
-	return a, time.Duration(s * float64(time.Second)), fb, false, true
+	m = leaseMsg{amps: a, hold: time.Duration(s * float64(time.Second)), fallback: fb}
+	if len(f) == 4 {
+		seq, err := strconv.ParseInt(f[3], 10, 64)
+		if err != nil || seq <= 0 {
+			return leaseMsg{}, false
+		}
+		m.seq = seq
+	}
+	return m, true
 }
 
 // handle applies one lease message.
 func (l *lease) handle(payload string) {
-	amps, hold, fallback, release, ok := parseLease(payload, l.maxAmps)
+	msg, ok := parseLease(payload, l.maxAmps)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -96,11 +121,22 @@ func (l *lease) handle(payload string) {
 	if !ok {
 		// neither renews nor cancels; logged once, then every 60th time
 		if l.badPayload%60 == 0 {
-			l.logf("Lease: ignoring malformed payload %q (want \"<amps> <seconds> <fallback>\" or \"0\", amps up to %d)", payload, l.maxAmps)
+			l.logf("Lease: ignoring malformed payload %q (want \"<amps> <seconds> <fallback> [<seq>]\" or \"0\", amps up to %d)", payload, l.maxAmps)
 		}
 		l.badPayload++
 		return
 	}
+	if msg.seq != 0 {
+		if msg.seq <= l.lastSeq && msg.seq > l.lastSeq-leaseSeqWindow {
+			if l.badPayload%60 == 0 {
+				l.logf("Lease: dropping out-of-order lease %q (last seq %d)", payload, l.lastSeq)
+			}
+			l.badPayload++
+			return
+		}
+		l.lastSeq = msg.seq
+	}
+	amps, hold, fallback, release := msg.amps, msg.hold, msg.fallback, msg.release
 
 	if release {
 		wasActive := l.active
