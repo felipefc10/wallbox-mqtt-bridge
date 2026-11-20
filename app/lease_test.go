@@ -11,10 +11,11 @@ import (
 
 // fakeCharger stands in for the charger's max_charging_current setting.
 type fakeCharger struct {
-	mu      sync.Mutex
-	current int
-	unknown bool  // reads fail
-	writes  []int // every value set, in order
+	mu        sync.Mutex
+	current   int
+	unknown   bool // reads fail
+	failWrite bool // writes are silently lost (the real setter only logs SQL errors)
+	writes    []int
 }
 
 func (f *fakeCharger) get() int {
@@ -29,14 +30,28 @@ func (f *fakeCharger) get() int {
 func (f *fakeCharger) set(a int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.current = a
 	f.writes = append(f.writes, a)
+	if !f.failWrite {
+		f.current = a
+	}
 }
 
-func (f *fakeCharger) now() (int, []int) {
+func (f *fakeCharger) cur() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.current, append([]int(nil), f.writes...)
+	return f.current
+}
+
+func (f *fakeCharger) with(fn func(*fakeCharger)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn(f)
+}
+
+func (f *fakeCharger) nWrites() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.writes)
 }
 
 func newTestLease(t *testing.T, start int, withMarker bool) (*lease, *fakeCharger, string) {
@@ -46,20 +61,32 @@ func newTestLease(t *testing.T, start int, withMarker bool) (*lease, *fakeCharge
 	if withMarker {
 		marker = filepath.Join(t.TempDir(), "lease.state")
 	}
-	l := newLease(ch.get, ch.set, marker)
+	l := newLease(ch.get, ch.set, 32, marker)
 	l.logf = t.Logf
+	l.retry = 10 * time.Millisecond
 	return l, ch, marker
+}
+
+func (l *lease) isActive() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.active
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+func markerExists(marker string) bool {
+	_, err := os.Stat(marker)
+	return err == nil
 }
 
 func TestParseLease(t *testing.T) {
@@ -74,165 +101,172 @@ func TestParseLease(t *testing.T) {
 		{" 16  12.5  6 ", 16, 12500 * time.Millisecond, 6, false},
 		{"0", 0, 0, 0, true},
 		{"6 3600 6", 6, time.Hour, 6, false},
+		{"32 1 0", 32, time.Second, 0, false},
 	}
 	for _, g := range good {
-		a, h, fb, rel, ok := parseLease(g.in)
+		a, h, fb, rel, ok := parseLease(g.in, 32)
 		if !ok || a != g.amps || h != g.hold || fb != g.fb || rel != g.release {
 			t.Errorf("parseLease(%q) = %d %v %d %v %v", g.in, a, h, fb, rel, ok)
 		}
 	}
-	for _, bad := range []string{"", "28", "28 20", "28 20 7 1", "x 20 7", "28 x 7", "28 20 x", "-1 20 7", "28 0 7", "28 -5 7", "28 20 -1", "28 3601 7", "1"} {
-		if _, _, _, _, ok := parseLease(bad); ok {
-			t.Errorf("parseLease(%q) accepted", bad)
+	bad := []string{"", "28", "28 20", "28 20 7 1", "x 20 7", "28 x 7", "28 20 x", "-1 20 7",
+		"28 0 7", "28 -5 7", "28 20 -1", "28 3601 7", "1", "28 NaN 7", "28 nan 7", "28 Inf 7",
+		"28 1e-9 7", "28 0.5 7", "33 20 7", "99 20 7", "2147483648 20 7", "28 20 33"}
+	for _, b := range bad {
+		if _, _, _, _, ok := parseLease(b, 32); ok {
+			t.Errorf("parseLease(%q) accepted", b)
 		}
 	}
 }
 
 func TestLeaseSetsCurrentAndExpiresToFallback(t *testing.T) {
 	l, ch, _ := newTestLease(t, 6, false)
-	l.handle("28 0.05 7")
-	if cur, _ := ch.now(); cur != 28 {
-		t.Fatalf("lease did not set the current: %d", cur)
+	l.handle("28 1 7")
+	if ch.cur() != 28 {
+		t.Fatalf("lease did not set the current: %d", ch.cur())
 	}
-	waitFor(t, "fallback", func() bool { cur, _ := ch.now(); return cur == 7 })
-	if l.active {
-		t.Fatal("lease still active after expiry")
-	}
+	waitFor(t, "fallback", func() bool { return ch.cur() == 7 })
+	waitFor(t, "lease ended", func() bool { return !l.isActive() })
 }
 
 func TestLeaseRenewalKeepsCurrent(t *testing.T) {
 	l, ch, _ := newTestLease(t, 6, false)
-	for i := 0; i < 6; i++ { // renewals every 20 ms, lease 60 ms: never expires
-		l.handle("28 0.06 7")
-		time.Sleep(20 * time.Millisecond)
+	for i := 0; i < 20; i++ { // renewals every 100 ms against a 1 s lease
+		l.handle("28 1 7")
+		time.Sleep(100 * time.Millisecond)
 	}
-	if cur, writes := ch.now(); cur != 28 || len(writes) != 1 {
-		t.Fatalf("renewals changed the current: now %d, writes %v", cur, writes)
+	if ch.cur() != 28 || ch.nWrites() != 1 {
+		t.Fatalf("renewals changed the current: now %d, %d writes", ch.cur(), ch.nWrites())
 	}
-	waitFor(t, "fallback after the last renewal", func() bool { cur, _ := ch.now(); return cur == 7 })
+	waitFor(t, "fallback after the last renewal", func() bool { return ch.cur() == 7 })
 }
 
 func TestLeaseNeverRaisesOnExpiry(t *testing.T) {
 	l, ch, _ := newTestLease(t, 6, false)
-	l.handle("10 0.03 7")
-	ch.set(6) // someone (evcc's own current command) lowered it below the fallback meanwhile
-	time.Sleep(80 * time.Millisecond)
-	if cur, _ := ch.now(); cur != 6 {
-		t.Fatalf("expiry raised the current to %d", cur)
+	l.handle("10 1 7")
+	ch.set(6) // evcc's own current command lowered it below the fallback meanwhile
+	waitFor(t, "expiry", func() bool { return !l.isActive() })
+	if ch.cur() != 6 {
+		t.Fatalf("expiry raised the current to %d", ch.cur())
 	}
 }
 
 func TestLeaseUnknownCurrentIsLowered(t *testing.T) {
 	l, ch, _ := newTestLease(t, 6, false)
-	l.handle("28 0.03 7")
-	ch.mu.Lock()
-	ch.unknown = true
-	ch.mu.Unlock()
-	waitFor(t, "fallback with unknown current", func() bool { cur, _ := ch.now(); return cur == 7 })
+	l.handle("28 1 7")
+	ch.with(func(f *fakeCharger) { f.unknown = true })
+	waitFor(t, "a fallback write", func() bool { return ch.cur() == 7 })
+	if !l.isActive() {
+		t.Fatal("lease ended without a confirmed fallback")
+	}
+	ch.with(func(f *fakeCharger) { f.unknown = false })
+	waitFor(t, "lease ended once the fallback reads back", func() bool { return !l.isActive() })
 }
 
-func TestLeaseReleaseStopsCountdown(t *testing.T) {
+func TestLeaseFailedFallbackWriteIsRetried(t *testing.T) {
 	l, ch, marker := newTestLease(t, 6, true)
-	l.handle("28 0.03 7")
-	l.handle("0")
-	time.Sleep(80 * time.Millisecond)
-	if cur, _ := ch.now(); cur != 28 {
-		t.Fatalf("released lease still fell back: %d", cur)
+	l.handle("28 1 7")
+	ch.with(func(f *fakeCharger) { f.failWrite = true }) // MySQL busy at expiry
+	waitFor(t, "several fallback attempts", func() bool { return ch.nWrites() >= 4 })
+	if ch.cur() != 28 || !l.isActive() || !markerExists(marker) {
+		t.Fatalf("a failed fallback must keep the lease and its marker: cur %d active %v", ch.cur(), l.isActive())
 	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatal("marker left after release")
+	ch.with(func(f *fakeCharger) { f.failWrite = false })
+	waitFor(t, "fallback once the database answers", func() bool { return ch.cur() == 7 && !l.isActive() })
+	waitFor(t, "marker removed", func() bool { return !markerExists(marker) })
+}
+
+func TestLeaseReleaseLowersAndStops(t *testing.T) {
+	l, ch, marker := newTestLease(t, 6, true)
+	l.handle("28 1 7")
+	l.handle("0")
+	if ch.cur() != 7 {
+		t.Fatalf("release left %d A above the fallback", ch.cur())
+	}
+	if markerExists(marker) || l.isActive() {
+		t.Fatal("release left the marker or the lease")
+	}
+	ch.set(16) // the controller sets its own current after the release: no countdown touches it
+	time.Sleep(1500 * time.Millisecond)
+	if ch.cur() != 16 {
+		t.Fatalf("a released lease still acted: %d", ch.cur())
+	}
+}
+
+func TestLeaseReleaseNeverRaises(t *testing.T) {
+	l, ch, _ := newTestLease(t, 6, false)
+	l.handle("28 5 7")
+	ch.set(6)
+	l.handle("0")
+	if ch.cur() != 6 {
+		t.Fatalf("release raised to %d", ch.cur())
+	}
+}
+
+func TestLeaseAtOrBelowFallbackNeedsNoCountdown(t *testing.T) {
+	l, ch, marker := newTestLease(t, 16, true)
+	l.handle("6 1 7")
+	if ch.cur() != 6 || l.isActive() || markerExists(marker) {
+		t.Fatalf("a lease at or below its fallback: cur %d active %v marker %v", ch.cur(), l.isActive(), markerExists(marker))
 	}
 }
 
 func TestLeaseMalformedIgnored(t *testing.T) {
 	l, ch, _ := newTestLease(t, 6, false)
-	l.handle("28 0.03 7")
-	l.handle("garbage") // must neither renew nor cancel
-	waitFor(t, "fallback", func() bool { cur, _ := ch.now(); return cur == 7 })
+	l.handle("28 1 7")
+	for i := 0; i < 100; i++ {
+		l.handle("garbage") // must neither renew nor cancel, and logs quietly
+	}
+	waitFor(t, "fallback", func() bool { return ch.cur() == 7 })
 }
 
 func TestLeaseMarkerBeforeRaiseAndOnlyOnChange(t *testing.T) {
 	l, ch, marker := newTestLease(t, 6, true)
-	written := 0
-	ch2 := ch
 	l.setCurrent = func(a int) {
-		// The marker must already exist whenever the lease raises the current.
-		if b, err := os.ReadFile(marker); err != nil || strings.TrimSpace(string(b)) != "7" {
-			t.Errorf("current set to %d before the marker held the fallback (err %v)", a, err)
+		// The marker must already hold the fallback whenever the lease raises the current.
+		if a > 7 {
+			if b, err := os.ReadFile(marker); err != nil || strings.TrimSpace(string(b)) == "" {
+				t.Errorf("current raised to %d before the marker existed (err %v)", a, err)
+			}
 		}
-		ch2.set(a)
+		ch.set(a)
 	}
-	stat := func() time.Time {
-		fi, err := os.Stat(marker)
-		if err != nil {
-			t.Fatalf("marker missing: %v", err)
-		}
-		return fi.ModTime()
-	}
-	l.handle("28 1 7")
-	first := stat()
-	written++
-	time.Sleep(20 * time.Millisecond)
-	l.handle("29 1 7") // same fallback: no rewrite (flash wear)
-	if !stat().Equal(first) {
+	l.handle("28 5 7")
+	os.WriteFile(marker, []byte("sentinel\n"), 0o644) // a rewrite would replace this
+	l.handle("29 5 7")                                // same fallback: no rewrite (flash wear)
+	if b, _ := os.ReadFile(marker); strings.TrimSpace(string(b)) != "sentinel" {
 		t.Fatal("marker rewritten on a plain renewal")
 	}
-	l.handle("29 1 6") // new fallback: rewritten
+	l.handle("29 5 6") // new fallback: rewritten
 	if b, _ := os.ReadFile(marker); strings.TrimSpace(string(b)) != "6" {
 		t.Fatalf("marker not updated to the new fallback: %q", b)
 	}
 	l.handle("0")
 }
 
-func TestLeaseRecoverAfterRestart(t *testing.T) {
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "lease.state")
-	if err := os.WriteFile(marker, []byte("7\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	ch := &fakeCharger{current: 28} // the charger kept the burst current across the reboot
-	l := newLease(ch.get, ch.set, marker)
+func TestLeaseNoRaiseWithoutMarker(t *testing.T) {
+	ch := &fakeCharger{current: 6}
+	l := newLease(ch.get, ch.set, 32, filepath.Join(t.TempDir(), "missing-dir", "lease.state"))
 	l.logf = t.Logf
-	l.recover()
-	if cur, _ := ch.now(); cur != 7 {
-		t.Fatalf("recover left %d A", cur)
+	l.retry = 10 * time.Millisecond
+	l.handle("28 5 7")
+	if ch.cur() > 7 {
+		t.Fatalf("raised to %d without a stored fallback", ch.cur())
 	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatal("marker not removed after recover")
-	}
-
-	// Already below the fallback: recover must not raise.
-	if err := os.WriteFile(marker, []byte("7\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	ch.set(6)
-	l.recover()
-	if cur, _ := ch.now(); cur != 6 {
-		t.Fatalf("recover raised to %d A", cur)
-	}
-
-	// No marker: nothing happens.
-	ch.set(28)
-	l.recover()
-	if cur, _ := ch.now(); cur != 28 {
-		t.Fatalf("recover without marker changed the current to %d", cur)
-	}
-
-	// Corrupt marker: removed, current untouched.
-	if err := os.WriteFile(marker, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	l.recover()
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatal("corrupt marker kept")
-	}
+	l.handle("0")
 }
 
-func TestLeaseExpiryRemovesMarker(t *testing.T) {
-	l, ch, marker := newTestLease(t, 6, true)
-	l.handle("28 0.03 7")
-	waitFor(t, "fallback", func() bool { cur, _ := ch.now(); return cur == 7 })
-	waitFor(t, "marker removed", func() bool { _, err := os.Stat(marker); return os.IsNotExist(err) })
+func TestLeaseRenewalRacingExpiry(t *testing.T) {
+	l, ch, _ := newTestLease(t, 6, false)
+	for i := 0; i < 50; i++ { // renewals land right around their own expiry
+		l.handle("28 1 7")
+		time.Sleep(time.Duration(990+i%20) * time.Millisecond / 50)
+	}
+	l.handle("28 1 7")
+	if ch.cur() != 28 {
+		t.Fatalf("a renewal was overtaken by an old countdown: %d", ch.cur())
+	}
+	waitFor(t, "final fallback", func() bool { return ch.cur() == 7 })
 }
 
 func TestLeaseConcurrentRenewals(t *testing.T) {
@@ -240,8 +274,91 @@ func TestLeaseConcurrentRenewals(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); l.handle("20 0.05 7") }()
+		go func() { defer wg.Done(); l.handle("20 1 7") }()
 	}
 	wg.Wait()
-	waitFor(t, "single clean fallback", func() bool { cur, _ := ch.now(); return cur == 7 })
+	waitFor(t, "single clean fallback", func() bool { return ch.cur() == 7 && !l.isActive() })
+}
+
+func TestLeaseShutdownAppliesFallback(t *testing.T) {
+	l, ch, marker := newTestLease(t, 6, true)
+	l.handle("28 60 7")
+	l.shutdown()
+	if ch.cur() != 7 || markerExists(marker) {
+		t.Fatalf("shutdown: cur %d, marker %v", ch.cur(), markerExists(marker))
+	}
+
+	// A failed write at shutdown keeps the marker for the next start.
+	l, ch, marker = newTestLease(t, 6, true)
+	l.handle("28 60 7")
+	ch.with(func(f *fakeCharger) { f.failWrite = true })
+	l.shutdown()
+	if !markerExists(marker) {
+		t.Fatal("marker removed although the fallback did not take")
+	}
+
+	// No lease: shutdown changes nothing.
+	l, ch, _ = newTestLease(t, 16, true)
+	l.shutdown()
+	if ch.cur() != 16 || ch.nWrites() != 0 {
+		t.Fatalf("shutdown without a lease wrote: %d", ch.cur())
+	}
+}
+
+func TestLeaseApplyStale(t *testing.T) {
+	cases := []struct {
+		name    string
+		marker  string // "" = no marker file
+		start   int
+		want    int
+		touched bool
+	}{
+		{"burst current kept across a reboot", "7\n", 28, 7, true},
+		{"already below: never raised", "7\n", 6, 6, false},
+		{"no marker: nothing happens", "", 28, 28, false},
+		{"corrupt marker: charger minimum", "x", 28, leaseMinAmps, true},
+		{"empty marker after a power cut: charger minimum", "", 28, leaseMinAmps, true},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			marker := filepath.Join(dir, "lease.state")
+			if c.marker != "" || i == 4 {
+				if err := os.WriteFile(marker, []byte(c.marker), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ch := &fakeCharger{current: c.start}
+			l := newLease(ch.get, ch.set, 32, marker)
+			l.logf = t.Logf
+			l.applyStale()
+			if ch.cur() != c.want {
+				t.Fatalf("current %d, want %d", ch.cur(), c.want)
+			}
+			if (ch.nWrites() > 0) != c.touched {
+				t.Fatalf("writes %d, touched want %v", ch.nWrites(), c.touched)
+			}
+			if markerExists(marker) {
+				t.Fatal("marker left after start")
+			}
+		})
+	}
+}
+
+func TestLeaseApplyStaleRetriesUntilItTakes(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "lease.state")
+	os.WriteFile(marker, []byte("7\n"), 0o644)
+	ch := &fakeCharger{current: 28, failWrite: true}
+	l := newLease(ch.get, ch.set, 32, marker)
+	l.logf = t.Logf
+	l.retry = 10 * time.Millisecond
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		ch.with(func(f *fakeCharger) { f.failWrite = false }) // MySQL comes up after boot
+	}()
+	l.applyStale()
+	if ch.cur() != 7 || markerExists(marker) {
+		t.Fatalf("applyStale gave up: cur %d marker %v", ch.cur(), markerExists(marker))
+	}
 }

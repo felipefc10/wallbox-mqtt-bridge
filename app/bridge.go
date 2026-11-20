@@ -40,8 +40,12 @@ func RunBridge(configPath string) {
 
 	// Before anything else: a lease that was running when the bridge or the
 	// charger stopped falls back now (see lease.go).
-	lease := newLease(w.ReadMaxChargingCurrent, w.SetMaxChargingCurrent, filepath.Join(filepath.Dir(configPath), "lease.state"))
-	lease.recover()
+	maxAmps := w.AvailableCurrent()
+	if maxAmps <= 0 { // some chargers report 0 until configured
+		maxAmps = 80
+	}
+	chargerLease := newLease(w.ReadMaxChargingCurrent, w.SetMaxChargingCurrent, maxAmps, filepath.Join(filepath.Dir(configPath), "lease.state"))
+	chargerLease.applyStale()
 
 	w.StartRedisSubscriptions()
 	defer w.StopRedisSubscriptions()
@@ -94,7 +98,7 @@ func RunBridge(configPath string) {
 				fmt.Println("Warning: ignoring retained lease:", string(msg.Payload()))
 				return
 			}
-			lease.handle(string(msg.Payload()))
+			chargerLease.handle(string(msg.Payload()))
 			return
 		}
 		entity, ok := entityConfig[field]
@@ -312,6 +316,7 @@ func RunBridge(configPath string) {
 
 		case <-interrupt:
 			fmt.Println("Interrupted. Exiting...")
+			chargerLease.shutdown()
 			token := client.Publish(availabilityTopic, 1, true, "offline")
 			token.WaitTimeout(mqttPublishTimeout)
 			client.Disconnect(250)

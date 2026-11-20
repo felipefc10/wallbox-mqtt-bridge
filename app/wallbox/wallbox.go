@@ -395,7 +395,9 @@ func (w *Wallbox) SetMaxChargingCurrent(current int) {
 // Returns -1 when the read fails.
 func (w *Wallbox) ReadMaxChargingCurrent() int {
 	var current int
-	if err := w.sqlClient.Get(&current, "SELECT `max_charging_current` FROM `wallbox_config` LIMIT 1"); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := w.sqlClient.GetContext(ctx, &current, "SELECT `max_charging_current` FROM `wallbox_config` LIMIT 1"); err != nil {
 		fmt.Println("SQL error in ReadMaxChargingCurrent:", err)
 		return -1
 	}

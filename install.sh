@@ -4,7 +4,7 @@
 systemctl stop mqtt-bridge 2> /dev/null
 systemctl disable mqtt-bridge 2> /dev/null
 rm -f /lib/systemd/system/mqtt-bridge.service
-find ~/mqtt-bridge/ -type f ! -name bridge.ini -delete
+find ~/mqtt-bridge/ -type f ! -name bridge.ini ! -name lease.state -delete
 
 # Download the bridge
 echo "Downloading the bridge"
