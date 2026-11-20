@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -36,6 +37,11 @@ func RunBridge(configPath string) {
 	w.IncludePowerBoost = c.Settings.PowerBoostEnabled
 
 	w.RefreshData()
+
+	// Before anything else: a lease that was running when the bridge or the
+	// charger stopped falls back now (see lease.go).
+	lease := newLease(w.ReadMaxChargingCurrent, w.SetMaxChargingCurrent, filepath.Join(filepath.Dir(configPath), "lease.state"))
+	lease.recover()
 
 	w.StartRedisSubscriptions()
 	defer w.StopRedisSubscriptions()
@@ -81,6 +87,16 @@ func RunBridge(configPath string) {
 			return
 		}
 		field := parts[1]
+		if field == "lease" { // a command only, not a Home Assistant entity
+			// A retained lease is an old one by definition: applying it after a
+			// restart would set a stale current.
+			if msg.Retained() {
+				fmt.Println("Warning: ignoring retained lease:", string(msg.Payload()))
+				return
+			}
+			lease.handle(string(msg.Payload()))
+			return
+		}
 		entity, ok := entityConfig[field]
 		if !ok || entity.Setter == nil {
 			// Ignore set commands for unknown or read-only entities.

@@ -390,6 +390,18 @@ func (w *Wallbox) SetMaxChargingCurrent(current int) {
 	}
 }
 
+// ReadMaxChargingCurrent reads the setting straight from the database, not from
+// the last poll: the lease must never act on a value up to a second old.
+// Returns -1 when the read fails.
+func (w *Wallbox) ReadMaxChargingCurrent() int {
+	var current int
+	if err := w.sqlClient.Get(&current, "SELECT `max_charging_current` FROM `wallbox_config` LIMIT 1"); err != nil {
+		fmt.Println("SQL error in ReadMaxChargingCurrent:", err)
+		return -1
+	}
+	return current
+}
+
 func (w *Wallbox) SetHaloBrightness(brightness int) {
 	if _, err := w.sqlClient.Exec("UPDATE `wallbox_config` SET `halo_brightness`=?", brightness); err != nil {
 		fmt.Println("SQL error in SetHaloBrightness:", err)
