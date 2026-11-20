@@ -100,6 +100,7 @@ func TestParseLease(t *testing.T) {
 		{"6 3600 6", leaseMsg{amps: 6, hold: time.Hour, fallback: 6}},
 		{"32 1 0", leaseMsg{amps: 32, hold: time.Second, fallback: 0}},
 		{"28 20 7 1795300000123", leaseMsg{amps: 28, hold: 20 * time.Second, fallback: 7, seq: 1795300000123}},
+		{"0 1795300000124", leaseMsg{release: true, seq: 1795300000124}},
 	}
 	for _, g := range good {
 		m, ok := parseLease(g.in, 32)
@@ -110,7 +111,7 @@ func TestParseLease(t *testing.T) {
 	bad := []string{"", "28", "28 20", "28 20 7 1 2", "x 20 7", "28 x 7", "28 20 x", "-1 20 7",
 		"28 0 7", "28 -5 7", "28 20 -1", "28 3601 7", "1", "28 NaN 7", "28 nan 7", "28 Inf 7",
 		"28 1e-9 7", "28 0.5 7", "33 20 7", "99 20 7", "2147483648 20 7", "28 20 33",
-		"28 20 7 x", "28 20 7 0", "28 20 7 -5"}
+		"28 20 7 x", "28 20 7 0", "28 20 7 -5", "0 x", "0 0", "0 -1", "0 1 2"}
 	for _, b := range bad {
 		if _, ok := parseLease(b, 32); ok {
 			t.Errorf("parseLease(%q) accepted", b)
@@ -140,6 +141,22 @@ func TestLeaseOutOfOrderDropped(t *testing.T) {
 	}
 	l.handle("20 5 7") // a lease without <seq> is always taken
 	l.handle("0")
+}
+
+func TestLeaseLateLeaseCannotOvertakeRelease(t *testing.T) {
+	l, ch, _ := newTestLease(t, 6, false)
+	l.handle("16 5 7 1001")
+	l.handle("0 1003")      // the controller lowered to the fallback and released
+	l.handle("16 5 7 1002") // the older lease arrives last: must not raise again
+	if ch.cur() != 7 || l.isActive() {
+		t.Fatalf("a late lease overtook the release: %d A, active %v", ch.cur(), l.isActive())
+	}
+	l.handle("0 1002") // an old release is out of order too
+	l.handle("18 5 7 1004")
+	if ch.cur() != 18 {
+		t.Fatalf("the next lease after the release: %d", ch.cur())
+	}
+	l.handle("0 1005")
 }
 
 func TestLeaseSetsCurrentAndExpiresToFallback(t *testing.T) {

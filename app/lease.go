@@ -14,7 +14,7 @@ import (
 // A lease lets the controller that sets the current (for example evcc's load
 // management) say how long its current may stand without hearing from it again:
 //
-//	<topic prefix>/lease/set   "<amps> <seconds> <fallback amps> [<seq>]"   or "0" to release
+//	<topic prefix>/lease/set   "<amps> <seconds> <fallback amps> [<seq>]"   or "0 [<seq>]" to release
 //
 // Every lease sets the current to <amps> and restarts a countdown of <seconds>.
 // If no new lease arrives in time, the bridge lowers the current to <fallback>
@@ -84,11 +84,19 @@ func newLease(get func() int, set func(int), maxAmps int, marker string) *lease 
 	}
 }
 
-// parseLease reads "<amps> <seconds> <fallback> [<seq>]" or "0". ok is false for anything else.
+// parseLease reads "<amps> <seconds> <fallback> [<seq>]" or "0 [<seq>]". ok is false for anything else.
 func parseLease(payload string, maxAmps int) (m leaseMsg, ok bool) {
 	f := strings.Fields(payload)
-	if len(f) == 1 && f[0] == "0" {
-		return leaseMsg{release: true}, true
+	if len(f) >= 1 && len(f) <= 2 && f[0] == "0" {
+		m = leaseMsg{release: true}
+		if len(f) == 2 {
+			seq, err := strconv.ParseInt(f[1], 10, 64)
+			if err != nil || seq <= 0 {
+				return leaseMsg{}, false
+			}
+			m.seq = seq
+		}
+		return m, true
 	}
 	if len(f) != 3 && len(f) != 4 {
 		return leaseMsg{}, false
@@ -97,7 +105,7 @@ func parseLease(payload string, maxAmps int) (m leaseMsg, ok bool) {
 	s, err2 := strconv.ParseFloat(f[1], 64)
 	fb, err3 := strconv.Atoi(f[2])
 	if err1 != nil || err2 != nil || err3 != nil || math.IsNaN(s) ||
-		a < 0 || a > maxAmps || fb < 0 || fb > maxAmps || s < 1 || s > 3600 {
+		a < 1 || a > maxAmps || fb < 0 || fb > maxAmps || s < 1 || s > 3600 { // "0" is the release
 		return leaseMsg{}, false
 	}
 	m = leaseMsg{amps: a, hold: time.Duration(s * float64(time.Second)), fallback: fb}
