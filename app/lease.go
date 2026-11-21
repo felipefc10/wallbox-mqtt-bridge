@@ -39,6 +39,7 @@ import (
 // here) and should use QoS 0, so that a lease queued during its own reconnect
 // is dropped rather than delivered late. A lease delayed in flight still counts
 // from its arrival, so the worst-case hold is <seconds> plus the network delay.
+//
 // <seq>, optional, is a counter the controller increases with every lease. A lease
 // just behind the last one seen (up to leaseSeqWindow back) arrived out of order and
 // is dropped, so an older, higher current can never overtake a newer, lower one. A
@@ -53,11 +54,11 @@ type lease struct {
 
 	mu         sync.Mutex
 	timer      *time.Timer
-	fallback   int  // fallback of the active lease, or of the last one after a release
-	active     bool // a lease is running
-	gen        uint64
-	lastSeq    int64 // highest <seq> seen, 0 before the first
-	badPayload int   // malformed and out-of-order payloads seen, for a quiet log
+	fallback   int    // fallback of the active lease, or of the last one after a release
+	active     bool   // a lease is running
+	gen        uint64 // bumped on every stop, so a timer that already fired does nothing
+	lastSeq    int64  // highest <seq> seen, 0 before the first
+	badPayload int    // malformed and out-of-order payloads seen, for a quiet log
 }
 
 // leaseMsg is one parsed lease message
@@ -87,35 +88,31 @@ func newLease(get func() int, set func(int), maxAmps int, marker string) *lease 
 // parseLease reads "<amps> <seconds> <fallback> [<seq>]" or "0 [<seq>]". ok is false for anything else.
 func parseLease(payload string, maxAmps int) (m leaseMsg, ok bool) {
 	f := strings.Fields(payload)
-	if len(f) >= 1 && len(f) <= 2 && f[0] == "0" {
-		m = leaseMsg{release: true}
-		if len(f) == 2 {
-			seq, err := strconv.ParseInt(f[1], 10, 64)
-			if err != nil || seq <= 0 {
-				return leaseMsg{}, false
-			}
-			m.seq = seq
-		}
-		return m, true
+	n := 3 // fields before the optional <seq>
+	if len(f) > 0 && f[0] == "0" {
+		m.release, n = true, 1
 	}
-	if len(f) != 3 && len(f) != 4 {
+	if len(f) != n && len(f) != n+1 {
 		return leaseMsg{}, false
 	}
-	a, err1 := strconv.Atoi(f[0])
-	s, err2 := strconv.ParseFloat(f[1], 64)
-	fb, err3 := strconv.Atoi(f[2])
-	if err1 != nil || err2 != nil || err3 != nil || math.IsNaN(s) ||
-		a < 1 || a > maxAmps || fb < 0 || fb > maxAmps || s < 1 || s > 3600 { // "0" is the release
-		return leaseMsg{}, false
-	}
-	m = leaseMsg{amps: a, hold: time.Duration(s * float64(time.Second)), fallback: fb}
-	if len(f) == 4 {
-		seq, err := strconv.ParseInt(f[3], 10, 64)
+	if len(f) == n+1 {
+		seq, err := strconv.ParseInt(f[n], 10, 64)
 		if err != nil || seq <= 0 {
 			return leaseMsg{}, false
 		}
 		m.seq = seq
 	}
+	if m.release {
+		return m, true
+	}
+	a, err1 := strconv.Atoi(f[0])
+	s, err2 := strconv.ParseFloat(f[1], 64)
+	fb, err3 := strconv.Atoi(f[2])
+	if err1 != nil || err2 != nil || err3 != nil || math.IsNaN(s) ||
+		a < 1 || a > maxAmps || fb < 0 || fb > maxAmps || s < 1 || s > 3600 {
+		return leaseMsg{}, false
+	}
+	m.amps, m.hold, m.fallback = a, time.Duration(s*float64(time.Second)), fb
 	return m, true
 }
 
@@ -126,29 +123,21 @@ func (l *lease) handle(payload string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if !ok {
-		// neither renews nor cancels; logged once, then every 60th time
-		if l.badPayload%60 == 0 {
-			l.logf("Lease: ignoring malformed payload %q (want \"<amps> <seconds> <fallback> [<seq>]\" or \"0\", amps up to %d)", payload, l.maxAmps)
-		}
-		l.badPayload++
+	if !ok { // neither renews nor cancels
+		l.logRejectedLocked("Lease: ignoring malformed payload %q (want \"<amps> <seconds> <fallback> [<seq>]\" or \"0\", amps up to %d)", payload, l.maxAmps)
 		return
 	}
 	if msg.seq != 0 {
 		if msg.seq <= l.lastSeq && msg.seq > l.lastSeq-leaseSeqWindow {
-			if l.badPayload%60 == 0 {
-				l.logf("Lease: dropping out-of-order lease %q (last seq %d)", payload, l.lastSeq)
-			}
-			l.badPayload++
+			l.logRejectedLocked("Lease: dropping out-of-order lease %q (last seq %d)", payload, l.lastSeq)
 			return
 		}
 		l.lastSeq = msg.seq
 	}
-	amps, hold, fallback, release := msg.amps, msg.hold, msg.fallback, msg.release
 
-	if release {
+	if msg.release {
 		wasActive := l.active
-		l.stopLocked()
+		l.endLocked()
 		if wasActive {
 			l.logf("Lease: released")
 			l.applyFallbackLocked("released")
@@ -157,34 +146,42 @@ func (l *lease) handle(payload string) {
 	}
 
 	// Nothing above the fallback to protect: apply the current, no countdown.
-	if amps <= fallback {
-		l.stopLocked()
-		l.fallback = fallback
-		l.setIfDifferent(amps)
+	if msg.amps <= msg.fallback {
+		l.endLocked()
+		l.fallback = msg.fallback
+		l.setIfDifferent(msg.amps)
 		return
 	}
 
 	// The marker goes down before the current goes up: a restart in between
 	// must still find the fallback. Without it, the current is not raised.
-	if !l.active || l.fallback != fallback {
-		if err := l.writeMarker(fallback); err != nil {
-			l.logf("Lease: cannot store the fallback (%v), not raising above %d A", err, fallback)
-			amps = fallback
+	// It is written only when it changes, to spare the flash.
+	amps := msg.amps
+	if !l.active || l.fallback != msg.fallback {
+		if err := l.writeMarker(msg.fallback); err != nil {
+			l.logf("Lease: cannot store the fallback (%v), not raising above %d A", err, msg.fallback)
+			amps = msg.fallback
 		}
 	}
 	if !l.active {
-		l.logf("Lease: active, %d A, fallback %d A after %s without renewal", amps, fallback, hold)
+		l.logf("Lease: active, %d A, fallback %d A after %s without renewal", amps, msg.fallback, msg.hold)
 	}
 	l.active = true
-	l.fallback = fallback
+	l.fallback = msg.fallback
 	l.setIfDifferent(amps)
 
-	l.gen++
+	l.stopTimerLocked()
 	gen := l.gen
-	if l.timer != nil {
-		l.timer.Stop()
+	l.timer = time.AfterFunc(msg.hold, func() { l.expire(gen) })
+}
+
+// logRejectedLocked logs a dropped payload once, then every 60th time, so a
+// misbehaving controller cannot flood the log.
+func (l *lease) logRejectedLocked(format string, args ...any) {
+	if l.badPayload%60 == 0 {
+		l.logf(format, args...)
 	}
-	l.timer = time.AfterFunc(hold, func() { l.expire(gen) })
+	l.badPayload++
 }
 
 func (l *lease) setIfDifferent(amps int) {
@@ -205,9 +202,7 @@ func (l *lease) expire(gen uint64) {
 		l.timer = time.AfterFunc(l.retry, func() { l.expire(gen) })
 		return
 	}
-	l.active = false
-	l.timer = nil
-	l.removeMarker()
+	l.endLocked()
 }
 
 // applyFallbackLocked lowers the current to the fallback if it is above it (or
@@ -265,25 +260,26 @@ func (l *lease) shutdown() {
 	if !l.active {
 		return
 	}
-	if l.timer != nil {
-		l.timer.Stop()
-		l.timer = nil
-	}
-	l.gen++
+	l.stopTimerLocked()
 	l.active = false
 	if l.applyFallbackLocked("bridge stopping") {
 		l.removeMarker()
 	}
 }
 
-func (l *lease) stopLocked() {
+// endLocked ends the lease: no countdown, no marker.
+func (l *lease) endLocked() {
+	l.stopTimerLocked()
+	l.active = false
+	l.removeMarker()
+}
+
+func (l *lease) stopTimerLocked() {
 	if l.timer != nil {
 		l.timer.Stop()
 		l.timer = nil
 	}
 	l.gen++
-	l.active = false
-	l.removeMarker()
 }
 
 // writeMarker stores the fallback durably: written, synced, renamed, directory synced.

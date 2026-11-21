@@ -61,10 +61,15 @@ func newTestLease(t *testing.T, start int, withMarker bool) (*lease, *fakeCharge
 	if withMarker {
 		marker = filepath.Join(t.TempDir(), "lease.state")
 	}
+	return leaseOn(t, ch, marker), ch, marker
+}
+
+// leaseOn returns a lease on ch that logs to the test and retries quickly.
+func leaseOn(t *testing.T, ch *fakeCharger, marker string) *lease {
 	l := newLease(ch.get, ch.set, 32, marker)
 	l.logf = t.Logf
 	l.retry = 10 * time.Millisecond
-	return l, ch, marker
+	return l
 }
 
 func (l *lease) isActive() bool {
@@ -286,9 +291,7 @@ func TestLeaseMarkerBeforeRaiseAndOnlyOnChange(t *testing.T) {
 
 func TestLeaseNoRaiseWithoutMarker(t *testing.T) {
 	ch := &fakeCharger{current: 6}
-	l := newLease(ch.get, ch.set, 32, filepath.Join(t.TempDir(), "missing-dir", "lease.state"))
-	l.logf = t.Logf
-	l.retry = 10 * time.Millisecond
+	l := leaseOn(t, ch, filepath.Join(t.TempDir(), "missing-dir", "lease.state"))
 	l.handle("28 5 7")
 	if ch.cur() > 7 {
 		t.Fatalf("raised to %d without a stored fallback", ch.cur())
@@ -348,30 +351,27 @@ func TestLeaseShutdownAppliesFallback(t *testing.T) {
 func TestLeaseApplyStale(t *testing.T) {
 	cases := []struct {
 		name    string
-		marker  string // "" = no marker file
+		marker  *string // nil = no marker file
 		start   int
 		want    int
 		touched bool
 	}{
-		{"burst current kept across a reboot", "7\n", 28, 7, true},
-		{"already below: never raised", "7\n", 6, 6, false},
-		{"no marker: nothing happens", "", 28, 28, false},
-		{"corrupt marker: charger minimum", "x", 28, leaseMinAmps, true},
-		{"empty marker after a power cut: charger minimum", "", 28, leaseMinAmps, true},
+		{"burst current kept across a reboot", ptr("7\n"), 28, 7, true},
+		{"already below: never raised", ptr("7\n"), 6, 6, false},
+		{"no marker: nothing happens", nil, 28, 28, false},
+		{"corrupt marker: charger minimum", ptr("x"), 28, leaseMinAmps, true},
+		{"empty marker after a power cut: charger minimum", ptr(""), 28, leaseMinAmps, true},
 	}
-	for i, c := range cases {
+	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			dir := t.TempDir()
-			marker := filepath.Join(dir, "lease.state")
-			if c.marker != "" || i == 4 {
-				if err := os.WriteFile(marker, []byte(c.marker), 0o644); err != nil {
+			marker := filepath.Join(t.TempDir(), "lease.state")
+			if c.marker != nil {
+				if err := os.WriteFile(marker, []byte(*c.marker), 0o644); err != nil {
 					t.Fatal(err)
 				}
 			}
 			ch := &fakeCharger{current: c.start}
-			l := newLease(ch.get, ch.set, 32, marker)
-			l.logf = t.Logf
-			l.applyStale()
+			leaseOn(t, ch, marker).applyStale()
 			if ch.cur() != c.want {
 				t.Fatalf("current %d, want %d", ch.cur(), c.want)
 			}
@@ -385,14 +385,13 @@ func TestLeaseApplyStale(t *testing.T) {
 	}
 }
 
+func ptr(s string) *string { return &s }
+
 func TestLeaseApplyStaleRetriesUntilItTakes(t *testing.T) {
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "lease.state")
+	marker := filepath.Join(t.TempDir(), "lease.state")
 	os.WriteFile(marker, []byte("7\n"), 0o644)
 	ch := &fakeCharger{current: 28, failWrite: true}
-	l := newLease(ch.get, ch.set, 32, marker)
-	l.logf = t.Logf
-	l.retry = 10 * time.Millisecond
+	l := leaseOn(t, ch, marker)
 	go func() {
 		time.Sleep(60 * time.Millisecond)
 		ch.with(func(f *fakeCharger) { f.failWrite = false }) // MySQL comes up after boot
