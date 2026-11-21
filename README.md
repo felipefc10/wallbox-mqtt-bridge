@@ -108,8 +108,27 @@ All topics are prefixed with `wallbox_<serial_number>/`.
 | `wallbox_<serial>/availability` | `online` / `offline` (retained LWT) |
 | `wallbox_<serial>/<entity>/state` | Current value (retained) |
 | `wallbox_<serial>/<entity>/set` | Write a new value |
+| `wallbox_<serial>/lease/set` | Current lease from a load controller (below) |
 
 Home Assistant discovery configs are published to `homeassistant/<component>/<serial>_<entity>/config`.
+
+### Current lease (for load controllers)
+
+A load controller (for example an energy manager keeping a house under its supply limit) can
+send the current with a deadline instead of a plain value:
+
+```
+wallbox_<serial>/lease/set   "<amps> <seconds> <fallback amps> [<seq>]"   or   "0 [<seq>]"
+```
+
+Each lease sets the max charging current to `<amps>` and restarts a countdown of `<seconds>`
+(1 to 3600). If no new lease arrives in time, the bridge itself lowers the current to
+`<fallback amps>`: a lost network, broker or controller can never leave a high current standing.
+`"0"` releases the lease and lowers to the last fallback. The bridge never raises the current on
+its own, verifies every fallback by reading it back, applies it on shutdown and, through a small
+`lease.state` file, after a restart or reboot mid-lease. `<seq>` is an optional counter that
+increases with every message; a message arriving behind a newer one is dropped. Publish leases
+non-retained: retained leases are ignored. Without leases nothing changes.
 
 ## Acknowledgments
 
